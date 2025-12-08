@@ -1,0 +1,4 @@
+node_modules
+tmp-npm-cache
+data
+npm-debug.log*

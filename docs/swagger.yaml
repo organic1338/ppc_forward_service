@@ -1,0 +1,238 @@
+basePath: /api/v1
+definitions:
+  main.createCustomerRequest:
+    properties:
+      name:
+        type: string
+    required:
+    - name
+    type: object
+  main.forwardInfoRequest:
+    properties:
+      duration:
+        type: integer
+      end_time:
+        type: integer
+      interaction_id:
+        type: string
+      phone_number:
+        type: string
+      start_time:
+        type: integer
+      summary:
+        type: string
+    required:
+    - duration
+    - end_time
+    - interaction_id
+    - phone_number
+    - start_time
+    - summary
+    type: object
+  main.updateCustomerRequest:
+    properties:
+      api_key:
+        type: string
+      name:
+        type: string
+      regenerate_api_key:
+        type: boolean
+    type: object
+info:
+  contact: {}
+  description: Admin creates customers and forwards call info; customers fetch latest
+    info per phone number.
+  title: PPC Forward Service API
+  version: "1.0"
+paths:
+  /create-customer:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Customer info
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/main.createCustomerRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - AdminKey: []
+      summary: Create customer
+      tags:
+      - admin
+  /customer/{id}:
+    delete:
+      parameters:
+      - description: Customer ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      responses:
+        "204":
+          description: deleted
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - AdminKey: []
+      summary: Delete customer
+      tags:
+      - admin
+    patch:
+      parameters:
+      - description: Customer ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: Fields to update
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/main.updateCustomerRequest'
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - AdminKey: []
+      summary: Update customer
+      tags:
+      - admin
+  /forward-info:
+    get:
+      parameters:
+      - description: Phone number
+        in: query
+        name: phone_number
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - CustomerKey: []
+      summary: Get latest forward info by phone number
+      tags:
+      - customer
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Forward info
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/main.forwardInfoRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - AdminKey: []
+      summary: Upsert forward info
+      tags:
+      - admin
+securityDefinitions:
+  AdminKey:
+    in: header
+    name: X-Admin-Key
+    type: apiKey
+  CustomerKey:
+    in: header
+    name: X-API-Key
+    type: apiKey
+swagger: "2.0"
