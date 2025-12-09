@@ -10,12 +10,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	ginSwagger "github.com/swaggo/gin-swagger"
 	swaggerFiles "github.com/swaggo/files"
+	ginSwagger "github.com/swaggo/gin-swagger"
 	_ "modernc.org/sqlite"
 
 	"ppc_forward_service/docs"
@@ -38,7 +39,24 @@ type Server struct {
 	adminKey string
 }
 
-var phonePrefixes = []string{"+40", "0040", "40"}
+var (
+	phoneCountryCodes = []string{
+		"1", "20", "27", "30", "31", "32", "33", "34", "39", "40", "44", "49",
+		"60", "61", "62", "63", "64", "65", "66",
+		"7", "81", "82", "86", "90", "91", "92", "93", "94", "95", "98",
+		"211", "212", "213", "216", "218", "254", "255", "256", "257", "258", "260", "261", "262", "263", "264", "265", "266", "267", "268", "269",
+		"290", "299",
+		"351", "352", "353", "354", "355", "356", "357", "358", "359",
+		"372", "373", "374", "375", "376", "377", "378", "380", "381", "382", "385", "386", "387", "389",
+		"420", "421", "423",
+		"501", "502", "503", "504", "505", "506", "507", "508", "509",
+		"590", "591", "592", "593", "594", "595", "596", "597", "598", "599",
+		"670", "672", "673", "674", "675", "676", "677", "678", "679",
+		"680", "681", "682", "683", "685", "686", "687", "688", "689",
+		"690", "691", "692", "850", "852", "853", "855", "856", "880", "886", "960", "961", "962", "963", "964", "965", "966", "967", "968", "970", "971", "972", "973", "974", "975", "976", "977", "992", "993", "994", "995", "996", "998",
+	}
+	phonePrefixes = buildPhonePrefixes(phoneCountryCodes)
+)
 
 func main() {
 	adminKey := os.Getenv("ADMIN_API_KEY")
@@ -65,8 +83,9 @@ func main() {
 	admin.Use(srv.requireAdmin())
 	admin.POST("/create-customer", srv.handleCreateCustomer)
 	admin.POST("/forward-info", srv.handleUpsertForwardInfo)
-	admin.PATCH("/customer/:id", srv.handleUpdateCustomer)
+	admin.PUT("/customer/:id", srv.handleUpdateCustomer)
 	admin.DELETE("/customer/:id", srv.handleDeleteCustomer)
+	admin.GET("/customers", srv.handleListCustomers)
 
 	customer := api.Group("/")
 	customer.Use(srv.requireCustomer())
@@ -97,26 +116,36 @@ func initDB(path string) (*sql.DB, error) {
 	db.SetMaxOpenConns(1)
 
 	schema := []string{
+		`PRAGMA foreign_keys = ON;`,
 		`CREATE TABLE IF NOT EXISTS customers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
+            name TEXT NOT NULL UNIQUE,
             api_key TEXT NOT NULL UNIQUE,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         );`,
-		`CREATE TABLE IF NOT EXISTS forward_info (
+		`DROP TABLE IF EXISTS forward_info;`,
+		`CREATE TABLE forward_info (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone_number TEXT NOT NULL UNIQUE,
+            customer_id INTEGER NOT NULL,
+            phone_number TEXT NOT NULL,
             summary TEXT,
             interaction_id TEXT,
             start_time INTEGER,
             end_time INTEGER,
             duration INTEGER,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(customer_id, phone_number),
+            FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE
         );`,
+		`CREATE INDEX IF NOT EXISTS idx_forward_info_customer ON forward_info(customer_id);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_name ON customers(name);`,
 	}
 
 	for _, stmt := range schema {
 		if _, err := db.Exec(stmt); err != nil {
+			if strings.Contains(err.Error(), "UNIQUE") && strings.Contains(err.Error(), "customers.name") {
+				return nil, fmt.Errorf("apply schema (customer name uniqueness): %w; resolve duplicate names before retrying", err)
+			}
 			return nil, fmt.Errorf("apply schema: %w", err)
 		}
 	}
@@ -173,6 +202,7 @@ type createCustomerRequest struct {
 // @Param body body createCustomerRequest true "Customer info"
 // @Success 201 {object} map[string]interface{}
 // @Failure 400 {object} map[string]string
+// @Failure 409 {object} map[string]string
 // @Failure 500 {object} map[string]string
 // @Router /create-customer [post]
 func (s *Server) handleCreateCustomer(c *gin.Context) {
@@ -182,23 +212,44 @@ func (s *Server) handleCreateCustomer(c *gin.Context) {
 		return
 	}
 
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name cannot be empty"})
+		return
+	}
+
+	var existingID int64
+	err := s.db.QueryRow("SELECT id FROM customers WHERE name = ?", name).Scan(&existingID)
+	if err == nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "customer name already exists", "id": existingID})
+		return
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not verify name uniqueness"})
+		return
+	}
+
 	apiKey := generateAPIKey()
 
-	res, err := s.db.Exec("INSERT INTO customers (name, api_key) VALUES (?, ?)", req.Name, apiKey)
+	res, err := s.db.Exec("INSERT INTO customers (name, api_key) VALUES (?, ?)", name, apiKey)
 	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") && strings.Contains(err.Error(), "customers.name") {
+			c.JSON(http.StatusConflict, gin.H{"error": "customer name already exists"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create customer"})
 		return
 	}
 
 	id, _ := res.LastInsertId()
-	c.JSON(http.StatusCreated, gin.H{"id": id, "name": req.Name, "api_key": apiKey})
+	c.JSON(http.StatusCreated, gin.H{"id": id, "name": name, "api_key": apiKey})
 }
 
 // updateCustomerRequest allows admin to change name and/or rotate API key.
 type updateCustomerRequest struct {
-	Name              *string `json:"name"`
-	APIKey            *string `json:"api_key"`
-	RegenerateAPIKey  bool    `json:"regenerate_api_key"`
+	Name             *string `json:"name"`
+	APIKey           *string `json:"api_key"`
+	RegenerateAPIKey bool    `json:"regenerate_api_key"`
 }
 
 // handleUpdateCustomer lets admin rename a customer or rotate their API key.
@@ -209,9 +260,10 @@ type updateCustomerRequest struct {
 // @Param body body updateCustomerRequest true "Fields to update"
 // @Success 200 {object} map[string]interface{}
 // @Failure 400 {object} map[string]string
+// @Failure 409 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /customer/{id} [patch]
+// @Router /customer/{id} [put]
 func (s *Server) handleUpdateCustomer(c *gin.Context) {
 	idParam := c.Param("id")
 	var req updateCustomerRequest
@@ -246,6 +298,19 @@ func (s *Server) handleUpdateCustomer(c *gin.Context) {
 		newName = trimmed
 	}
 
+	if newName != current.name {
+		var otherID int64
+		err := s.db.QueryRow("SELECT id FROM customers WHERE name = ?", newName).Scan(&otherID)
+		if err == nil && otherID != current.id {
+			c.JSON(http.StatusConflict, gin.H{"error": "customer name already exists", "id": otherID})
+			return
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not verify name uniqueness"})
+			return
+		}
+	}
+
 	if req.RegenerateAPIKey {
 		newKey = generateAPIKey()
 	} else if req.APIKey != nil {
@@ -262,6 +327,14 @@ func (s *Server) handleUpdateCustomer(c *gin.Context) {
 	}
 
 	if _, err := s.db.Exec("UPDATE customers SET name = ?, api_key = ? WHERE id = ?", newName, newKey, current.id); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") && strings.Contains(err.Error(), "customers.name") {
+			c.JSON(http.StatusConflict, gin.H{"error": "customer name already exists"})
+			return
+		}
+		if strings.Contains(err.Error(), "UNIQUE") && strings.Contains(err.Error(), "customers.api_key") {
+			c.JSON(http.StatusConflict, gin.H{"error": "api_key already exists"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed"})
 		return
 	}
@@ -293,14 +366,56 @@ func (s *Server) handleDeleteCustomer(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+// customerRecord is returned in list responses.
+type customerRecord struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	APIKey    string `json:"api_key"`
+	CreatedAt string `json:"created_at"`
+}
+
+// handleListCustomers returns all customers.
+// @Summary List customers
+// @Tags admin
+// @Security AdminKey
+// @Produce json
+// @Success 200 {array} customerRecord
+// @Failure 500 {object} map[string]string
+// @Router /customers [get]
+func (s *Server) handleListCustomers(c *gin.Context) {
+	rows, err := s.db.Query("SELECT id, name, api_key, created_at FROM customers ORDER BY id ASC")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not list customers"})
+		return
+	}
+	defer rows.Close()
+
+	var customers []customerRecord
+	for rows.Next() {
+		var rec customerRecord
+		if err := rows.Scan(&rec.ID, &rec.Name, &rec.APIKey, &rec.CreatedAt); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read customers"})
+			return
+		}
+		customers = append(customers, rec)
+	}
+	if err := rows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read customers"})
+		return
+	}
+
+	c.JSON(http.StatusOK, customers)
+}
+
 // forwardInfoRequest holds the payload sent by the admin.
 type forwardInfoRequest struct {
-	PhoneNumber   string `json:"phone_number" binding:"required"`
-	Summary       string `json:"summary" binding:"required"`
-	InteractionID string `json:"interaction_id" binding:"required"`
-	StartTime     int64  `json:"start_time" binding:"required"`
-	EndTime       int64  `json:"end_time" binding:"required"`
-	Duration      int64  `json:"duration" binding:"required"`
+	CustomerAPIKey string `json:"customer_api_key" binding:"required"`
+	PhoneNumber    string `json:"phone_number" binding:"required"`
+	Summary        string `json:"summary" binding:"required"`
+	InteractionID  string `json:"interaction_id" binding:"required"`
+	StartTime      int64  `json:"start_time" binding:"required"`
+	EndTime        int64  `json:"end_time" binding:"required"`
+	Duration       int64  `json:"duration" binding:"required"`
 }
 
 // handleUpsertForwardInfo inserts or updates the latest info for a phone number.
@@ -327,23 +442,33 @@ func (s *Server) handleUpsertForwardInfo(c *gin.Context) {
 		return
 	}
 
+	var customerID int64
+	if err := s.db.QueryRow("SELECT id FROM customers WHERE api_key = ?", req.CustomerAPIKey).Scan(&customerID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid customer_api_key"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "customer lookup failed"})
+		return
+	}
+
 	_, err = s.db.Exec(`
-        INSERT INTO forward_info (phone_number, summary, interaction_id, start_time, end_time, duration, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, strftime('%s','now'))
-        ON CONFLICT(phone_number) DO UPDATE SET
+        INSERT INTO forward_info (customer_id, phone_number, summary, interaction_id, start_time, end_time, duration, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+        ON CONFLICT(customer_id, phone_number) DO UPDATE SET
             summary=excluded.summary,
             interaction_id=excluded.interaction_id,
             start_time=excluded.start_time,
             end_time=excluded.end_time,
             duration=excluded.duration,
             updated_at=strftime('%s','now');
-    `, normalized, req.Summary, req.InteractionID, req.StartTime, req.EndTime, req.Duration)
+    `, customerID, normalized, req.Summary, req.InteractionID, req.StartTime, req.EndTime, req.Duration)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to store forward info"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"phone_number": normalized, "status": "stored"})
+	c.JSON(http.StatusOK, gin.H{"phone_number": normalized, "customer_id": customerID, "status": "stored"})
 }
 
 // handleGetForwardInfo returns the latest info for a phone number.
@@ -370,8 +495,14 @@ func (s *Server) handleGetForwardInfo(c *gin.Context) {
 		return
 	}
 
+	customerID, ok := c.Get("customerID")
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "customer context missing"})
+		return
+	}
+
 	var info forwardInfoRequest
-	row := s.db.QueryRow("SELECT phone_number, summary, interaction_id, start_time, end_time, duration FROM forward_info WHERE phone_number = ?", normalized)
+	row := s.db.QueryRow("SELECT phone_number, summary, interaction_id, start_time, end_time, duration FROM forward_info WHERE customer_id = ? AND phone_number = ?", customerID, normalized)
 	var phoneStored string
 	if err := row.Scan(&phoneStored, &info.Summary, &info.InteractionID, &info.StartTime, &info.EndTime, &info.Duration); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -403,28 +534,51 @@ func normalizePhone(raw string) (string, error) {
 		return -1
 	}, raw)
 
+	if cleaned == "" {
+		return "", fmt.Errorf("phone number cannot be empty")
+	}
+
+	if strings.HasPrefix(cleaned, "00") {
+		cleaned = "+" + strings.TrimPrefix(cleaned, "00")
+	}
+
+	prefixMatched := false
 	for _, p := range phonePrefixes {
 		if strings.HasPrefix(cleaned, p) {
 			cleaned = strings.TrimPrefix(cleaned, p)
+			prefixMatched = true
 			break
 		}
 	}
 
 	cleaned = strings.TrimPrefix(cleaned, "+")
 
+	if len(cleaned) == 0 {
+		return "", fmt.Errorf("phone number too short after removing prefix")
+	}
+
 	if len(cleaned) == 9 && cleaned[0] != '0' {
 		cleaned = "0" + cleaned
 	}
 
-	if !strings.HasPrefix(cleaned, "0") {
-		return "", fmt.Errorf("unsupported phone prefix")
-	}
-
-	if len(cleaned) < 9 {
+	if len(cleaned) < 7 {
 		return "", fmt.Errorf("phone number too short after normalization")
 	}
 
+	if !prefixMatched && !strings.HasPrefix(cleaned, "0") {
+		return "", fmt.Errorf("unsupported phone prefix")
+	}
+
 	return cleaned, nil
+}
+
+func buildPhonePrefixes(codes []string) []string {
+	var prefixes []string
+	for _, code := range codes {
+		prefixes = append(prefixes, "+"+code, "00"+code, code)
+	}
+	sort.Slice(prefixes, func(i, j int) bool { return len(prefixes[i]) > len(prefixes[j]) })
+	return prefixes
 }
 
 func generateAPIKey() string {

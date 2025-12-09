@@ -28,8 +28,9 @@ PORT=9090 ADMIN_API_KEY=supersecret go run .
 The server listens on `:PORT` and serves API under `/api/v1`. Swagger UI is at `/swagger/index.html`.
 
 ## Phone number normalization
-- Accepts national (`0722123456`) or international (`+40722123456`, `0040722123456`, `40722123456`).
-- Normalizes to local format with leading `0`, ensuring one row per phone number.
+- Accepts national (`0722123456`) or international with `+`, `00`, or bare country code (e.g. `+40722123456`, `0040722123456`, `40722123456`).
+- Supports many country codes out of the box: `+40`, `+972`, `+1`, `+44`, `+49`, `+33`, `+39`, `+34`, `+30`, `+31`, `+32`, `+351`–`+359`, `+81`, `+82`, `+86`, `+852`, `+853`, `+90`–`+98`, and more.
+- Strips the international prefix and normalizes to a consistent digit-only form (adds a leading `0` for 9‑digit national numbers), so the same number is treated identically across the supported formats.
 
 ## Admin endpoints (header: `X-Admin-Key: <ADMIN_API_KEY>`, base path `/api/v1`)
 
@@ -40,10 +41,11 @@ curl -X POST http://localhost:8080/api/v1/create-customer \
   -H "Content-Type: application/json" \
   -d '{"name":"Acme"}'
 ```
+Customer names are unique. A request with an existing name returns `409 Conflict`.
 
 ### Update customer (rename / rotate key)
 ```bash
-curl -X PATCH http://localhost:8080/api/v1/customer/1 \
+curl -X PUT http://localhost:8080/api/v1/customer/1 \
   -H "X-Admin-Key: $ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"name":"Acme Europe","regenerate_api_key":true}'
@@ -55,12 +57,19 @@ curl -X DELETE http://localhost:8080/api/v1/customer/1 \
   -H "X-Admin-Key: $ADMIN_API_KEY"
 ```
 
+### List customers
+```bash
+curl http://localhost:8080/api/v1/customers \
+  -H "X-Admin-Key: $ADMIN_API_KEY"
+```
+
 ### Upsert forward info
 ```bash
 curl -X POST http://localhost:8080/api/v1/forward-info \
   -H "X-Admin-Key: $ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
+    "customer_api_key": "<customer_api_key>",
     "phone_number": "+40722123456",
     "summary": "Call about pricing",
     "interaction_id": "int-123",
@@ -69,6 +78,7 @@ curl -X POST http://localhost:8080/api/v1/forward-info \
     "duration": 35
   }'
 ```
+Forward info is stored per customer; different customers can store different data for the same phone number, distinguished by `customer_api_key`.
 
 ## Customer endpoint (header: `X-API-Key: <customer_api_key>`, base path `/api/v1`)
 
@@ -99,4 +109,3 @@ $(go env GOPATH)/bin/swag init --parseDependency --parseInternal --output docs
 ## Database
 - File: `data/forward.db` (auto-created).
 - Tables: `customers`, `forward_info` (one row per normalized phone number, upsert on conflict).
-

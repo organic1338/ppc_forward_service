@@ -7,8 +7,21 @@ definitions:
     required:
     - name
     type: object
+  main.customerRecord:
+    properties:
+      api_key:
+        type: string
+      created_at:
+        type: string
+      id:
+        type: integer
+      name:
+        type: string
+    type: object
   main.forwardInfoRequest:
     properties:
+      customer_api_key:
+        type: string
       duration:
         type: integer
       end_time:
@@ -22,6 +35,7 @@ definitions:
       summary:
         type: string
     required:
+    - customer_api_key
     - duration
     - end_time
     - interaction_id
@@ -70,6 +84,12 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "409":
+          description: Conflict
+          schema:
+            additionalProperties:
+              type: string
+            type: object
         "500":
           description: Internal Server Error
           schema:
@@ -109,7 +129,7 @@ paths:
       summary: Delete customer
       tags:
       - admin
-    patch:
+    put:
       parameters:
       - description: Customer ID
         in: path
@@ -140,6 +160,12 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "409":
+          description: Conflict
+          schema:
+            additionalProperties:
+              type: string
+            type: object
         "500":
           description: Internal Server Error
           schema:
@@ -149,6 +175,28 @@ paths:
       security:
       - AdminKey: []
       summary: Update customer
+      tags:
+      - admin
+  /customers:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/main.customerRecord'
+            type: array
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - AdminKey: []
+      summary: List customers
       tags:
       - admin
   /forward-info:
