@@ -2,9 +2,12 @@ basePath: /api/v1
 definitions:
   main.createCustomerRequest:
     properties:
+      default_country_code:
+        type: string
       name:
         type: string
     required:
+    - default_country_code
     - name
     type: object
   main.customerRecord:
@@ -13,6 +16,8 @@ definitions:
         type: string
       created_at:
         type: string
+      default_country_code:
+        type: string
       id:
         type: integer
       name:
@@ -20,7 +25,7 @@ definitions:
     type: object
   main.forwardInfoRequest:
     properties:
-      customer_api_key:
+      customer_name:
         type: string
       duration:
         type: integer
@@ -35,7 +40,7 @@ definitions:
       summary:
         type: string
     required:
-    - customer_api_key
+    - customer_name
     - duration
     - end_time
     - interaction_id
@@ -46,6 +51,8 @@ definitions:
   main.updateCustomerRequest:
     properties:
       api_key:
+        type: string
+      default_country_code:
         type: string
       name:
         type: string

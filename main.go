@@ -39,6 +39,12 @@ type Server struct {
 	adminKey string
 }
 
+type apiError string
+
+const (
+	errorPhoneNumberNotFound apiError = "phone_number_not_found"
+)
+
 var (
 	phoneCountryCodes = []string{
 		"1", "20", "27", "30", "31", "32", "33", "34", "39", "40", "44", "49",
@@ -121,6 +127,7 @@ func initDB(path string) (*sql.DB, error) {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
             api_key TEXT NOT NULL UNIQUE,
+            default_country_code TEXT NOT NULL DEFAULT '40',
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         );`,
 		`DROP TABLE IF EXISTS forward_info;`,
@@ -139,12 +146,17 @@ func initDB(path string) (*sql.DB, error) {
         );`,
 		`CREATE INDEX IF NOT EXISTS idx_forward_info_customer ON forward_info(customer_id);`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_name ON customers(name);`,
+		// For existing databases: add column if it doesn't yet exist.
+		`ALTER TABLE customers ADD COLUMN default_country_code TEXT NOT NULL DEFAULT '40';`,
 	}
 
 	for _, stmt := range schema {
 		if _, err := db.Exec(stmt); err != nil {
 			if strings.Contains(err.Error(), "UNIQUE") && strings.Contains(err.Error(), "customers.name") {
 				return nil, fmt.Errorf("apply schema (customer name uniqueness): %w; resolve duplicate names before retrying", err)
+			}
+			if strings.Contains(err.Error(), "duplicate column name") && strings.Contains(err.Error(), "default_country_code") {
+				continue
 			}
 			return nil, fmt.Errorf("apply schema: %w", err)
 		}
@@ -174,7 +186,8 @@ func (s *Server) requireCustomer() gin.HandlerFunc {
 		}
 
 		var id int64
-		if err := s.db.QueryRow("SELECT id FROM customers WHERE api_key = ?", key).Scan(&id); err != nil {
+		var defaultCC string
+		if err := s.db.QueryRow("SELECT id, default_country_code FROM customers WHERE api_key = ?", key).Scan(&id, &defaultCC); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid api key"})
 				return
@@ -184,13 +197,15 @@ func (s *Server) requireCustomer() gin.HandlerFunc {
 		}
 
 		c.Set("customerID", id)
+		c.Set("customerDefaultCC", defaultCC)
 		c.Next()
 	}
 }
 
 // createCustomerRequest holds admin input for customer provisioning.
 type createCustomerRequest struct {
-	Name string `json:"name" binding:"required"`
+	Name               string `json:"name" binding:"required"`
+	DefaultCountryCode string `json:"default_country_code" binding:"required"`
 }
 
 // handleCreateCustomer provisions an API key for a new customer.
@@ -218,6 +233,12 @@ func (s *Server) handleCreateCustomer(c *gin.Context) {
 		return
 	}
 
+	cc := strings.TrimSpace(req.DefaultCountryCode)
+	if err := validateCountryCode(cc); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	var existingID int64
 	err := s.db.QueryRow("SELECT id FROM customers WHERE name = ?", name).Scan(&existingID)
 	if err == nil {
@@ -231,7 +252,7 @@ func (s *Server) handleCreateCustomer(c *gin.Context) {
 
 	apiKey := generateAPIKey()
 
-	res, err := s.db.Exec("INSERT INTO customers (name, api_key) VALUES (?, ?)", name, apiKey)
+	res, err := s.db.Exec("INSERT INTO customers (name, api_key, default_country_code) VALUES (?, ?, ?)", name, apiKey, cc)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") && strings.Contains(err.Error(), "customers.name") {
 			c.JSON(http.StatusConflict, gin.H{"error": "customer name already exists"})
@@ -247,9 +268,10 @@ func (s *Server) handleCreateCustomer(c *gin.Context) {
 
 // updateCustomerRequest allows admin to change name and/or rotate API key.
 type updateCustomerRequest struct {
-	Name             *string `json:"name"`
-	APIKey           *string `json:"api_key"`
-	RegenerateAPIKey bool    `json:"regenerate_api_key"`
+	Name               *string `json:"name"`
+	APIKey             *string `json:"api_key"`
+	DefaultCountryCode *string `json:"default_country_code"`
+	RegenerateAPIKey   bool    `json:"regenerate_api_key"`
 }
 
 // handleUpdateCustomer lets admin rename a customer or rotate their API key.
@@ -273,11 +295,12 @@ func (s *Server) handleUpdateCustomer(c *gin.Context) {
 	}
 
 	var current struct {
-		id     int64
-		name   string
-		apiKey string
+		id                 int64
+		name               string
+		apiKey             string
+		defaultCountryCode string
 	}
-	if err := s.db.QueryRow("SELECT id, name, api_key FROM customers WHERE id = ?", idParam).Scan(&current.id, &current.name, &current.apiKey); err != nil {
+	if err := s.db.QueryRow("SELECT id, name, api_key, default_country_code FROM customers WHERE id = ?", idParam).Scan(&current.id, &current.name, &current.apiKey, &current.defaultCountryCode); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "customer not found"})
 			return
@@ -288,6 +311,7 @@ func (s *Server) handleUpdateCustomer(c *gin.Context) {
 
 	newName := current.name
 	newKey := current.apiKey
+	newCC := current.defaultCountryCode
 
 	if req.Name != nil {
 		trimmed := strings.TrimSpace(*req.Name)
@@ -311,6 +335,14 @@ func (s *Server) handleUpdateCustomer(c *gin.Context) {
 		}
 	}
 
+	if req.DefaultCountryCode != nil {
+		if err := validateCountryCode(strings.TrimSpace(*req.DefaultCountryCode)); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		newCC = strings.TrimSpace(*req.DefaultCountryCode)
+	}
+
 	if req.RegenerateAPIKey {
 		newKey = generateAPIKey()
 	} else if req.APIKey != nil {
@@ -321,12 +353,12 @@ func (s *Server) handleUpdateCustomer(c *gin.Context) {
 		newKey = *req.APIKey
 	}
 
-	if newName == current.name && newKey == current.apiKey {
+	if newName == current.name && newKey == current.apiKey && newCC == current.defaultCountryCode {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no changes supplied"})
 		return
 	}
 
-	if _, err := s.db.Exec("UPDATE customers SET name = ?, api_key = ? WHERE id = ?", newName, newKey, current.id); err != nil {
+	if _, err := s.db.Exec("UPDATE customers SET name = ?, api_key = ?, default_country_code = ? WHERE id = ?", newName, newKey, newCC, current.id); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") && strings.Contains(err.Error(), "customers.name") {
 			c.JSON(http.StatusConflict, gin.H{"error": "customer name already exists"})
 			return
@@ -353,25 +385,46 @@ func (s *Server) handleUpdateCustomer(c *gin.Context) {
 // @Router /customer/{id} [delete]
 func (s *Server) handleDeleteCustomer(c *gin.Context) {
 	idParam := c.Param("id")
-	res, err := s.db.Exec("DELETE FROM customers WHERE id = ?", idParam)
+	tx, err := s.db.Begin()
 	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed"})
+		return
+	}
+
+	if _, err := tx.Exec("DELETE FROM forward_info WHERE customer_id = ?", idParam); err != nil {
+		_ = tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed"})
+		return
+	}
+
+	res, err := tx.Exec("DELETE FROM customers WHERE id = ?", idParam)
+	if err != nil {
+		_ = tx.Rollback()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed"})
 		return
 	}
 	count, _ := res.RowsAffected()
 	if count == 0 {
+		_ = tx.Rollback()
 		c.JSON(http.StatusNotFound, gin.H{"error": "customer not found"})
 		return
 	}
+
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed"})
+		return
+	}
+
 	c.Status(http.StatusNoContent)
 }
 
 // customerRecord is returned in list responses.
 type customerRecord struct {
-	ID        int64  `json:"id"`
-	Name      string `json:"name"`
-	APIKey    string `json:"api_key"`
-	CreatedAt string `json:"created_at"`
+	ID                 int64  `json:"id"`
+	Name               string `json:"name"`
+	APIKey             string `json:"api_key"`
+	DefaultCountryCode string `json:"default_country_code"`
+	CreatedAt          string `json:"created_at"`
 }
 
 // handleListCustomers returns all customers.
@@ -383,7 +436,7 @@ type customerRecord struct {
 // @Failure 500 {object} map[string]string
 // @Router /customers [get]
 func (s *Server) handleListCustomers(c *gin.Context) {
-	rows, err := s.db.Query("SELECT id, name, api_key, created_at FROM customers ORDER BY id ASC")
+	rows, err := s.db.Query("SELECT id, name, api_key, default_country_code, created_at FROM customers ORDER BY id ASC")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not list customers"})
 		return
@@ -393,7 +446,7 @@ func (s *Server) handleListCustomers(c *gin.Context) {
 	var customers []customerRecord
 	for rows.Next() {
 		var rec customerRecord
-		if err := rows.Scan(&rec.ID, &rec.Name, &rec.APIKey, &rec.CreatedAt); err != nil {
+		if err := rows.Scan(&rec.ID, &rec.Name, &rec.APIKey, &rec.DefaultCountryCode, &rec.CreatedAt); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read customers"})
 			return
 		}
@@ -409,13 +462,22 @@ func (s *Server) handleListCustomers(c *gin.Context) {
 
 // forwardInfoRequest holds the payload sent by the admin.
 type forwardInfoRequest struct {
-	CustomerAPIKey string `json:"customer_api_key" binding:"required"`
-	PhoneNumber    string `json:"phone_number" binding:"required"`
-	Summary        string `json:"summary" binding:"required"`
-	InteractionID  string `json:"interaction_id" binding:"required"`
-	StartTime      int64  `json:"start_time" binding:"required"`
-	EndTime        int64  `json:"end_time" binding:"required"`
-	Duration       int64  `json:"duration" binding:"required"`
+	CustomerName  string `json:"customer_name" binding:"required"`
+	PhoneNumber   string `json:"phone_number" binding:"required"`
+	Summary       string `json:"summary" binding:"required"`
+	InteractionID string `json:"interaction_id" binding:"required"`
+	StartTime     int64  `json:"start_time" binding:"required"`
+	EndTime       int64  `json:"end_time" binding:"required"`
+	Duration      int64  `json:"duration" binding:"required"`
+}
+
+type forwardInfoResponse struct {
+	Summary       string `json:"summary"`
+	InteractionID string `json:"interaction_id"`
+	StartTime     int64  `json:"start_time"`
+	EndTime       int64  `json:"end_time"`
+	Duration      int64  `json:"duration"`
+	Error         string `json:"error"`
 }
 
 // handleUpsertForwardInfo inserts or updates the latest info for a phone number.
@@ -436,19 +498,26 @@ func (s *Server) handleUpsertForwardInfo(c *gin.Context) {
 		return
 	}
 
-	normalized, err := normalizePhone(req.PhoneNumber)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	customerName := strings.TrimSpace(req.CustomerName)
+	if customerName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "customer_name cannot be empty"})
 		return
 	}
 
 	var customerID int64
-	if err := s.db.QueryRow("SELECT id FROM customers WHERE api_key = ?", req.CustomerAPIKey).Scan(&customerID); err != nil {
+	var defaultCC string
+	if err := s.db.QueryRow("SELECT id, default_country_code FROM customers WHERE name = ?", customerName).Scan(&customerID, &defaultCC); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid customer_api_key"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "customer not found"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "customer lookup failed"})
+		return
+	}
+
+	normalized, err := normalizePhone(req.PhoneNumber, defaultCC, true)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -468,7 +537,7 @@ func (s *Server) handleUpsertForwardInfo(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"phone_number": normalized, "customer_id": customerID, "status": "stored"})
+	c.JSON(http.StatusOK, gin.H{"phone_number": normalized, "customer_id": customerID, "customer_name": customerName, "status": "stored"})
 }
 
 // handleGetForwardInfo returns the latest info for a phone number.
@@ -479,7 +548,6 @@ func (s *Server) handleUpsertForwardInfo(c *gin.Context) {
 // @Param phone_number query string true "Phone number"
 // @Success 200 {object} map[string]interface{}
 // @Failure 400 {object} map[string]string
-// @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
 // @Router /forward-info [get]
 func (s *Server) handleGetForwardInfo(c *gin.Context) {
@@ -489,7 +557,10 @@ func (s *Server) handleGetForwardInfo(c *gin.Context) {
 		return
 	}
 
-	normalized, err := normalizePhone(phone)
+	defaultCC, _ := c.Get("customerDefaultCC")
+	ccStr, _ := defaultCC.(string)
+
+	normalized, err := normalizePhone(phone, ccStr, true)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -501,28 +572,40 @@ func (s *Server) handleGetForwardInfo(c *gin.Context) {
 		return
 	}
 
-	var info forwardInfoRequest
-	row := s.db.QueryRow("SELECT phone_number, summary, interaction_id, start_time, end_time, duration FROM forward_info WHERE customer_id = ? AND phone_number = ?", customerID, normalized)
+	candidates := []string{normalized}
+	if alt, err := normalizePhoneWithoutDefault(phone); err == nil && alt != normalized {
+		candidates = append(candidates, alt)
+	}
+
+	var info forwardInfoResponse
 	var phoneStored string
-	if err := row.Scan(&phoneStored, &info.Summary, &info.InteractionID, &info.StartTime, &info.EndTime, &info.Duration); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "no info found for phone number"})
+	found := false
+	for _, cand := range candidates {
+		row := s.db.QueryRow("SELECT phone_number, summary, interaction_id, start_time, end_time, duration FROM forward_info WHERE customer_id = ? AND phone_number = ?", customerID, cand)
+		if err := row.Scan(&phoneStored, &info.Summary, &info.InteractionID, &info.StartTime, &info.EndTime, &info.Duration); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "lookup failed"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "lookup failed"})
+		found = true
+		normalized = cand
+		break
+	}
+
+	if !found {
+		c.JSON(http.StatusOK, forwardInfoResponse{
+			Error: string(errorPhoneNumberNotFound),
+		})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"summary":        info.Summary,
-		"interaction_id": info.InteractionID,
-		"start_time":     info.StartTime,
-		"end_time":       info.EndTime,
-		"duration":       info.Duration,
-	})
+	info.Error = ""
+	c.JSON(http.StatusOK, info)
 }
 
-func normalizePhone(raw string) (string, error) {
+func normalizePhone(raw string, defaultCountryCode string, prependDefault bool) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("phone number cannot be empty")
 	}
@@ -538,12 +621,28 @@ func normalizePhone(raw string) (string, error) {
 		return "", fmt.Errorf("phone number cannot be empty")
 	}
 
+	defaultCountryCode = strings.TrimSpace(defaultCountryCode)
+	if defaultCountryCode == "" {
+		defaultCountryCode = "40"
+	}
+	if err := validateCountryCode(defaultCountryCode); err != nil {
+		return "", err
+	}
+
+	// If no explicit international prefix, optionally prepend default country code.
+	if prependDefault && !strings.HasPrefix(cleaned, "+") && !strings.HasPrefix(cleaned, "00") {
+		cleaned = "+" + defaultCountryCode + cleaned
+	}
+
 	if strings.HasPrefix(cleaned, "00") {
 		cleaned = "+" + strings.TrimPrefix(cleaned, "00")
 	}
 
+	localPrefixes := append([]string{"+" + defaultCountryCode, "00" + defaultCountryCode, defaultCountryCode}, phonePrefixes...)
+	sort.Slice(localPrefixes, func(i, j int) bool { return len(localPrefixes[i]) > len(localPrefixes[j]) })
+
 	prefixMatched := false
-	for _, p := range phonePrefixes {
+	for _, p := range localPrefixes {
 		if strings.HasPrefix(cleaned, p) {
 			cleaned = strings.TrimPrefix(cleaned, p)
 			prefixMatched = true
@@ -579,6 +678,26 @@ func buildPhonePrefixes(codes []string) []string {
 	}
 	sort.Slice(prefixes, func(i, j int) bool { return len(prefixes[i]) > len(prefixes[j]) })
 	return prefixes
+}
+
+func validateCountryCode(code string) error {
+	if code == "" {
+		return fmt.Errorf("default_country_code cannot be empty")
+	}
+	for _, r := range code {
+		if r < '0' || r > '9' {
+			return fmt.Errorf("default_country_code must contain digits only")
+		}
+	}
+	if len(code) < 1 || len(code) > 4 {
+		return fmt.Errorf("default_country_code must be 1 to 4 digits")
+	}
+	return nil
+}
+
+// normalizePhoneWithoutDefault leaves the number as-is (no automatic country prepend) but still strips known prefixes.
+func normalizePhoneWithoutDefault(raw string) (string, error) {
+	return normalizePhone(raw, "", false)
 }
 
 func generateAPIKey() string {

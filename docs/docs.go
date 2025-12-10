@@ -360,9 +360,13 @@ const docTemplate = `{
         "main.createCustomerRequest": {
             "type": "object",
             "required": [
+                "default_country_code",
                 "name"
             ],
             "properties": {
+                "default_country_code": {
+                    "type": "string"
+                },
                 "name": {
                     "type": "string"
                 }
@@ -377,6 +381,9 @@ const docTemplate = `{
                 "created_at": {
                     "type": "string"
                 },
+                "default_country_code": {
+                    "type": "string"
+                },
                 "id": {
                     "type": "integer"
                 },
@@ -388,7 +395,7 @@ const docTemplate = `{
         "main.forwardInfoRequest": {
             "type": "object",
             "required": [
-                "customer_api_key",
+                "customer_name",
                 "duration",
                 "end_time",
                 "interaction_id",
@@ -397,7 +404,7 @@ const docTemplate = `{
                 "summary"
             ],
             "properties": {
-                "customer_api_key": {
+                "customer_name": {
                     "type": "string"
                 },
                 "duration": {
@@ -424,6 +431,9 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "api_key": {
+                    "type": "string"
+                },
+                "default_country_code": {
                     "type": "string"
                 },
                 "name": {

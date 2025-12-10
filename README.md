@@ -23,6 +23,10 @@ source .env
 go run .
 # or
 PORT=9090 ADMIN_API_KEY=supersecret go run .
+# or with env from .env
+./run.sh
+# background mode (persists after SSH): logs to server.log by default
+./run.sh --background
 ```
 
 The server listens on `:PORT` and serves API under `/api/v1`. Swagger UI is at `/swagger/index.html`.
@@ -39,9 +43,10 @@ The server listens on `:PORT` and serves API under `/api/v1`. Swagger UI is at `
 curl -X POST http://localhost:8080/api/v1/create-customer \
   -H "X-Admin-Key: $ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"name":"Acme"}'
+  -d '{"name":"Acme","default_country_code":"40"}'
 ```
 Customer names are unique. A request with an existing name returns `409 Conflict`.
+`default_country_code` is the numeric country code (e.g., `"40"` for Romania, `"972"` for Israel, `"1"` for US/Canada) used to infer a full international prefix when numbers arrive without one.
 
 ### Update customer (rename / rotate key)
 ```bash
@@ -69,8 +74,8 @@ curl -X POST http://localhost:8080/api/v1/forward-info \
   -H "X-Admin-Key: $ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "customer_api_key": "<customer_api_key>",
-    "phone_number": "+40722123456",
+    "customer_name": "Acme",
+    "phone_number": "0722123456",
     "summary": "Call about pricing",
     "interaction_id": "int-123",
     "start_time": 1733670000,
@@ -78,7 +83,7 @@ curl -X POST http://localhost:8080/api/v1/forward-info \
     "duration": 35
   }'
 ```
-Forward info is stored per customer; different customers can store different data for the same phone number, distinguished by `customer_api_key`.
+If the phone number does not include an international prefix, the customer's `default_country_code` is automatically prepended (e.g., `0722...` becomes `+40 722...` for Romania) before normalization. Forward info is stored per customer; different customers can store different data for the same phone number, distinguished by `customer_name` in the admin upsert request.
 
 ## Customer endpoint (header: `X-API-Key: <customer_api_key>`, base path `/api/v1`)
 

@@ -1,0 +1,140 @@
+{
+  "info": {
+    "_postman_id": "2f3e8f4e-b4a2-4f06-8f72-9c1d2c2a7e41",
+    "name": "PPC Forward Service",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8080/api/v1" },
+    { "key": "admin_key", "value": "ADMIN_API_KEY" },
+    { "key": "customer_key", "value": "CUSTOMER_API_KEY" },
+    { "key": "customer_id", "value": "1" },
+    { "key": "customer_name", "value": "Acme" },
+    { "key": "default_country_code", "value": "40" },
+    { "key": "phone_number", "value": "+40722123456" },
+    { "key": "interaction_id", "value": "int-123" }
+  ],
+  "item": [
+    {
+      "name": "Admin - Create Customer",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "X-Admin-Key", "value": "{{admin_key}}", "type": "text" },
+          { "key": "Content-Type", "value": "application/json", "type": "text" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"{{customer_name}}\",\n  \"default_country_code\": \"{{default_country_code}}\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/create-customer",
+          "host": ["{{base_url}}"],
+          "path": ["create-customer"]
+        }
+      }
+    },
+    {
+      "name": "Admin - Update Customer",
+      "request": {
+        "method": "PUT",
+        "header": [
+          { "key": "X-Admin-Key", "value": "{{admin_key}}", "type": "text" },
+          { "key": "Content-Type", "value": "application/json", "type": "text" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"{{customer_name}} Updated\",\n  \"default_country_code\": \"972\",\n  \"regenerate_api_key\": true\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/customer/{{customer_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["customer", "{{customer_id}}"]
+        }
+      }
+    },
+    {
+      "name": "Admin - List Customers",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "X-Admin-Key", "value": "{{admin_key}}", "type": "text" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/customers",
+          "host": ["{{base_url}}"],
+          "path": ["customers"]
+        }
+      }
+    },
+    {
+      "name": "Admin - Delete Customer",
+      "request": {
+        "method": "DELETE",
+        "header": [
+          { "key": "X-Admin-Key", "value": "{{admin_key}}", "type": "text" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/customer/{{customer_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["customer", "{{customer_id}}"]
+        }
+      }
+    },
+    {
+      "name": "Admin - Upsert Forward Info (with prefix)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "X-Admin-Key", "value": "{{admin_key}}", "type": "text" },
+          { "key": "Content-Type", "value": "application/json", "type": "text" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"customer_name\": \"{{customer_name}}\",\n  \"phone_number\": \"+40722123456\",\n  \"summary\": \"Call about pricing\",\n  \"interaction_id\": \"{{interaction_id}}\",\n  \"start_time\": 1733670000,\n  \"end_time\": 1733670035,\n  \"duration\": 35\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/forward-info",
+          "host": ["{{base_url}}"],
+          "path": ["forward-info"]
+        }
+      }
+    },
+    {
+      "name": "Admin - Upsert Forward Info (without prefix, uses default_country_code)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "X-Admin-Key", "value": "{{admin_key}}", "type": "text" },
+          { "key": "Content-Type", "value": "application/json", "type": "text" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"customer_name\": \"{{customer_name}}\",\n  \"phone_number\": \"0722123456\",\n  \"summary\": \"National format; will prepend default country code\",\n  \"interaction_id\": \"{{interaction_id}}\",\n  \"start_time\": 1733671000,\n  \"end_time\": 1733671030,\n  \"duration\": 30\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/forward-info",
+          "host": ["{{base_url}}"],
+          "path": ["forward-info"]
+        }
+      }
+    },
+    {
+      "name": "Customer - Get Forward Info",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "X-API-Key", "value": "{{customer_key}}", "type": "text" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/forward-info?phone_number={{phone_number}}",
+          "host": ["{{base_url}}"],
+          "path": ["forward-info"],
+          "query": [
+            { "key": "phone_number", "value": "{{phone_number}}" }
+          ]
+        }
+      }
+    }
+  ]
+}
