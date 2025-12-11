@@ -25,7 +25,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"name\": \"{{customer_name}}\",\n  \"default_country_code\": \"{{default_country_code}}\"\n}"
+          "raw": "{\n  \"name\": \"{{customer_name}}\",\n  \"default_country_code\": \"{{default_country_code}}\",\n  \"default_extra_data\": {\n    \"brand\": \"{{customer_name}}\",\n    \"locale\": \"en-US\"\n  }\n}"
         },
         "url": {
           "raw": "{{base_url}}/create-customer",
@@ -44,7 +44,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"name\": \"{{customer_name}} Updated\",\n  \"default_country_code\": \"972\",\n  \"regenerate_api_key\": true\n}"
+          "raw": "{\n  \"name\": \"{{customer_name}} Updated\",\n  \"default_country_code\": \"972\",\n  \"regenerate_api_key\": true,\n  \"default_extra_data\": {\n    \"brand\": \"{{customer_name}} Updated\",\n    \"locale\": \"he-IL\"\n  }\n}"
         },
         "url": {
           "raw": "{{base_url}}/customer/{{customer_id}}",
@@ -91,7 +91,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"customer_name\": \"{{customer_name}}\",\n  \"phone_number\": \"+40722123456\",\n  \"summary\": \"Call about pricing\",\n  \"interaction_id\": \"{{interaction_id}}\",\n  \"start_time\": 1733670000,\n  \"end_time\": 1733670035,\n  \"duration\": 35\n}"
+          "raw": "{\n  \"customer_name\": \"{{customer_name}}\",\n  \"phone_number\": \"+40722123456\",\n  \"summary\": \"Call about pricing\",\n  \"interaction_id\": \"{{interaction_id}}\",\n  \"start_time\": 1733670000,\n  \"end_time\": 1733670035,\n  \"duration\": 35,\n  \"extra_data\": {\n    \"agent\": \"Maria\",\n    \"topic\": \"pricing\",\n    \"is_vip\": true\n  }\n}"
         },
         "url": {
           "raw": "{{base_url}}/forward-info",
@@ -110,7 +110,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"customer_name\": \"{{customer_name}}\",\n  \"phone_number\": \"0722123456\",\n  \"summary\": \"National format; will prepend default country code\",\n  \"interaction_id\": \"{{interaction_id}}\",\n  \"start_time\": 1733671000,\n  \"end_time\": 1733671030,\n  \"duration\": 30\n}"
+          "raw": "{\n  \"customer_name\": \"{{customer_name}}\",\n  \"phone_number\": \"0722123456\",\n  \"summary\": \"National format; will prepend default country code\",\n  \"interaction_id\": \"{{interaction_id}}\",\n  \"start_time\": 1733671000,\n  \"end_time\": 1733671030,\n  \"duration\": 30,\n  \"extra_data\": {\n    \"agent\": \"Maria\",\n    \"topic\": \"follow-up\"\n  }\n}"
         },
         "url": {
           "raw": "{{base_url}}/forward-info",

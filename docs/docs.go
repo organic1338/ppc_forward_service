@@ -277,15 +277,6 @@ const docTemplate = `{
                             }
                         }
                     },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
-                        }
-                    },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
@@ -367,6 +358,10 @@ const docTemplate = `{
                 "default_country_code": {
                     "type": "string"
                 },
+                "default_extra_data": {
+                    "type": "object",
+                    "additionalProperties": true
+                },
                 "name": {
                     "type": "string"
                 }
@@ -413,6 +408,10 @@ const docTemplate = `{
                 "end_time": {
                     "type": "integer"
                 },
+                "extra_data": {
+                    "type": "object",
+                    "additionalProperties": true
+                },
                 "interaction_id": {
                     "type": "string"
                 },
@@ -435,6 +434,10 @@ const docTemplate = `{
                 },
                 "default_country_code": {
                     "type": "string"
+                },
+                "default_extra_data": {
+                    "type": "object",
+                    "additionalProperties": true
                 },
                 "name": {
                     "type": "string"

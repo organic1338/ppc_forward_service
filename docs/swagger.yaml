@@ -4,6 +4,9 @@ definitions:
     properties:
       default_country_code:
         type: string
+      default_extra_data:
+        additionalProperties: true
+        type: object
       name:
         type: string
     required:
@@ -31,6 +34,9 @@ definitions:
         type: integer
       end_time:
         type: integer
+      extra_data:
+        additionalProperties: true
+        type: object
       interaction_id:
         type: string
       phone_number:
@@ -54,6 +60,9 @@ definitions:
         type: string
       default_country_code:
         type: string
+      default_extra_data:
+        additionalProperties: true
+        type: object
       name:
         type: string
       regenerate_api_key:
@@ -224,12 +233,6 @@ paths:
             type: object
         "400":
           description: Bad Request
-          schema:
-            additionalProperties:
-              type: string
-            type: object
-        "404":
-          description: Not Found
           schema:
             additionalProperties:
               type: string

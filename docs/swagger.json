@@ -269,15 +269,6 @@
                             }
                         }
                     },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
-                        }
-                    },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
@@ -359,6 +350,10 @@
                 "default_country_code": {
                     "type": "string"
                 },
+                "default_extra_data": {
+                    "type": "object",
+                    "additionalProperties": true
+                },
                 "name": {
                     "type": "string"
                 }
@@ -405,6 +400,10 @@
                 "end_time": {
                     "type": "integer"
                 },
+                "extra_data": {
+                    "type": "object",
+                    "additionalProperties": true
+                },
                 "interaction_id": {
                     "type": "string"
                 },
@@ -427,6 +426,10 @@
                 },
                 "default_country_code": {
                     "type": "string"
+                },
+                "default_extra_data": {
+                    "type": "object",
+                    "additionalProperties": true
                 },
                 "name": {
                     "type": "string"

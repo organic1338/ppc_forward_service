@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -128,6 +129,7 @@ func initDB(path string) (*sql.DB, error) {
             name TEXT NOT NULL UNIQUE,
             api_key TEXT NOT NULL UNIQUE,
             default_country_code TEXT NOT NULL DEFAULT '40',
+			default_extra_data TEXT NOT NULL DEFAULT '{}',
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         );`,
 		`DROP TABLE IF EXISTS forward_info;`,
@@ -140,6 +142,7 @@ func initDB(path string) (*sql.DB, error) {
             start_time INTEGER,
             end_time INTEGER,
             duration INTEGER,
+			extra_data TEXT,
             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(customer_id, phone_number),
             FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE
@@ -148,6 +151,7 @@ func initDB(path string) (*sql.DB, error) {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_name ON customers(name);`,
 		// For existing databases: add column if it doesn't yet exist.
 		`ALTER TABLE customers ADD COLUMN default_country_code TEXT NOT NULL DEFAULT '40';`,
+		`ALTER TABLE customers ADD COLUMN default_extra_data TEXT NOT NULL DEFAULT '{}';`,
 	}
 
 	for _, stmt := range schema {
@@ -156,6 +160,9 @@ func initDB(path string) (*sql.DB, error) {
 				return nil, fmt.Errorf("apply schema (customer name uniqueness): %w; resolve duplicate names before retrying", err)
 			}
 			if strings.Contains(err.Error(), "duplicate column name") && strings.Contains(err.Error(), "default_country_code") {
+				continue
+			}
+			if strings.Contains(err.Error(), "duplicate column name") && strings.Contains(err.Error(), "default_extra_data") {
 				continue
 			}
 			return nil, fmt.Errorf("apply schema: %w", err)
@@ -187,7 +194,8 @@ func (s *Server) requireCustomer() gin.HandlerFunc {
 
 		var id int64
 		var defaultCC string
-		if err := s.db.QueryRow("SELECT id, default_country_code FROM customers WHERE api_key = ?", key).Scan(&id, &defaultCC); err != nil {
+		var defaultExtraRaw sql.NullString
+		if err := s.db.QueryRow("SELECT id, default_country_code, default_extra_data FROM customers WHERE api_key = ?", key).Scan(&id, &defaultCC, &defaultExtraRaw); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid api key"})
 				return
@@ -198,14 +206,17 @@ func (s *Server) requireCustomer() gin.HandlerFunc {
 
 		c.Set("customerID", id)
 		c.Set("customerDefaultCC", defaultCC)
+		defaultExtra := decodeMapFromJSON(defaultExtraRaw.String)
+		c.Set("customerDefaultExtraData", defaultExtra)
 		c.Next()
 	}
 }
 
 // createCustomerRequest holds admin input for customer provisioning.
 type createCustomerRequest struct {
-	Name               string `json:"name" binding:"required"`
-	DefaultCountryCode string `json:"default_country_code" binding:"required"`
+	Name               string                 `json:"name" binding:"required"`
+	DefaultCountryCode string                 `json:"default_country_code" binding:"required"`
+	DefaultExtraData   map[string]interface{} `json:"default_extra_data"`
 }
 
 // handleCreateCustomer provisions an API key for a new customer.
@@ -252,7 +263,13 @@ func (s *Server) handleCreateCustomer(c *gin.Context) {
 
 	apiKey := generateAPIKey()
 
-	res, err := s.db.Exec("INSERT INTO customers (name, api_key, default_country_code) VALUES (?, ?, ?)", name, apiKey, cc)
+	defaultExtraJSON, err := encodeMapToJSON(req.DefaultExtraData)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid default_extra_data", "details": err.Error()})
+		return
+	}
+
+	res, err := s.db.Exec("INSERT INTO customers (name, api_key, default_country_code, default_extra_data) VALUES (?, ?, ?, ?)", name, apiKey, cc, defaultExtraJSON)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") && strings.Contains(err.Error(), "customers.name") {
 			c.JSON(http.StatusConflict, gin.H{"error": "customer name already exists"})
@@ -268,10 +285,11 @@ func (s *Server) handleCreateCustomer(c *gin.Context) {
 
 // updateCustomerRequest allows admin to change name and/or rotate API key.
 type updateCustomerRequest struct {
-	Name               *string `json:"name"`
-	APIKey             *string `json:"api_key"`
-	DefaultCountryCode *string `json:"default_country_code"`
-	RegenerateAPIKey   bool    `json:"regenerate_api_key"`
+	Name               *string                 `json:"name"`
+	APIKey             *string                 `json:"api_key"`
+	DefaultCountryCode *string                 `json:"default_country_code"`
+	DefaultExtraData   *map[string]interface{} `json:"default_extra_data"`
+	RegenerateAPIKey   bool                    `json:"regenerate_api_key"`
 }
 
 // handleUpdateCustomer lets admin rename a customer or rotate their API key.
@@ -299,8 +317,9 @@ func (s *Server) handleUpdateCustomer(c *gin.Context) {
 		name               string
 		apiKey             string
 		defaultCountryCode string
+		defaultExtraData   string
 	}
-	if err := s.db.QueryRow("SELECT id, name, api_key, default_country_code FROM customers WHERE id = ?", idParam).Scan(&current.id, &current.name, &current.apiKey, &current.defaultCountryCode); err != nil {
+	if err := s.db.QueryRow("SELECT id, name, api_key, default_country_code, default_extra_data FROM customers WHERE id = ?", idParam).Scan(&current.id, &current.name, &current.apiKey, &current.defaultCountryCode, &current.defaultExtraData); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "customer not found"})
 			return
@@ -312,6 +331,7 @@ func (s *Server) handleUpdateCustomer(c *gin.Context) {
 	newName := current.name
 	newKey := current.apiKey
 	newCC := current.defaultCountryCode
+	newDefaultExtra := current.defaultExtraData
 
 	if req.Name != nil {
 		trimmed := strings.TrimSpace(*req.Name)
@@ -343,6 +363,15 @@ func (s *Server) handleUpdateCustomer(c *gin.Context) {
 		newCC = strings.TrimSpace(*req.DefaultCountryCode)
 	}
 
+	if req.DefaultExtraData != nil {
+		encoded, err := encodeMapToJSON(*req.DefaultExtraData)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid default_extra_data", "details": err.Error()})
+			return
+		}
+		newDefaultExtra = encoded
+	}
+
 	if req.RegenerateAPIKey {
 		newKey = generateAPIKey()
 	} else if req.APIKey != nil {
@@ -353,12 +382,12 @@ func (s *Server) handleUpdateCustomer(c *gin.Context) {
 		newKey = *req.APIKey
 	}
 
-	if newName == current.name && newKey == current.apiKey && newCC == current.defaultCountryCode {
+	if newName == current.name && newKey == current.apiKey && newCC == current.defaultCountryCode && newDefaultExtra == current.defaultExtraData {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no changes supplied"})
 		return
 	}
 
-	if _, err := s.db.Exec("UPDATE customers SET name = ?, api_key = ?, default_country_code = ? WHERE id = ?", newName, newKey, newCC, current.id); err != nil {
+	if _, err := s.db.Exec("UPDATE customers SET name = ?, api_key = ?, default_country_code = ?, default_extra_data = ? WHERE id = ?", newName, newKey, newCC, newDefaultExtra, current.id); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") && strings.Contains(err.Error(), "customers.name") {
 			c.JSON(http.StatusConflict, gin.H{"error": "customer name already exists"})
 			return
@@ -462,13 +491,14 @@ func (s *Server) handleListCustomers(c *gin.Context) {
 
 // forwardInfoRequest holds the payload sent by the admin.
 type forwardInfoRequest struct {
-	CustomerName  string `json:"customer_name" binding:"required"`
-	PhoneNumber   string `json:"phone_number" binding:"required"`
-	Summary       string `json:"summary" binding:"required"`
-	InteractionID string `json:"interaction_id" binding:"required"`
-	StartTime     int64  `json:"start_time" binding:"required"`
-	EndTime       int64  `json:"end_time" binding:"required"`
-	Duration      int64  `json:"duration" binding:"required"`
+	CustomerName  string                 `json:"customer_name" binding:"required"`
+	PhoneNumber   string                 `json:"phone_number" binding:"required"`
+	Summary       string                 `json:"summary" binding:"required"`
+	InteractionID string                 `json:"interaction_id" binding:"required"`
+	StartTime     int64                  `json:"start_time" binding:"required"`
+	EndTime       int64                  `json:"end_time" binding:"required"`
+	Duration      int64                  `json:"duration" binding:"required"`
+	ExtraData     map[string]interface{} `json:"extra_data"`
 }
 
 type forwardInfoResponse struct {
@@ -521,17 +551,28 @@ func (s *Server) handleUpsertForwardInfo(c *gin.Context) {
 		return
 	}
 
+	var extraJSON interface{}
+	if req.ExtraData != nil {
+		serialized, err := json.Marshal(req.ExtraData)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid extra_data", "details": err.Error()})
+			return
+		}
+		extraJSON = string(serialized)
+	}
+
 	_, err = s.db.Exec(`
-        INSERT INTO forward_info (customer_id, phone_number, summary, interaction_id, start_time, end_time, duration, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
-        ON CONFLICT(customer_id, phone_number) DO UPDATE SET
-            summary=excluded.summary,
-            interaction_id=excluded.interaction_id,
-            start_time=excluded.start_time,
-            end_time=excluded.end_time,
-            duration=excluded.duration,
-            updated_at=strftime('%s','now');
-    `, customerID, normalized, req.Summary, req.InteractionID, req.StartTime, req.EndTime, req.Duration)
+		INSERT INTO forward_info (customer_id, phone_number, summary, interaction_id, start_time, end_time, duration, extra_data, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+		ON CONFLICT(customer_id, phone_number) DO UPDATE SET
+			summary=excluded.summary,
+			interaction_id=excluded.interaction_id,
+			start_time=excluded.start_time,
+			end_time=excluded.end_time,
+			duration=excluded.duration,
+			extra_data=excluded.extra_data,
+			updated_at=strftime('%s','now');
+	`, customerID, normalized, req.Summary, req.InteractionID, req.StartTime, req.EndTime, req.Duration, extraJSON)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to store forward info"})
 		return
@@ -560,6 +601,21 @@ func (s *Server) handleGetForwardInfo(c *gin.Context) {
 	defaultCC, _ := c.Get("customerDefaultCC")
 	ccStr, _ := defaultCC.(string)
 
+	defaultExtra, _ := c.Get("customerDefaultExtraData")
+	defaultExtraMap, _ := defaultExtra.(map[string]interface{})
+	if defaultExtraMap == nil {
+		defaultExtraMap = map[string]interface{}{}
+	}
+
+	reservedKeys := map[string]struct{}{
+		"summary":        {},
+		"interaction_id": {},
+		"start_time":     {},
+		"end_time":       {},
+		"duration":       {},
+		"error":          {},
+	}
+
 	normalized, err := normalizePhone(phone, ccStr, true)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -578,11 +634,12 @@ func (s *Server) handleGetForwardInfo(c *gin.Context) {
 	}
 
 	var info forwardInfoResponse
+	var extraRaw sql.NullString
 	var phoneStored string
 	found := false
 	for _, cand := range candidates {
-		row := s.db.QueryRow("SELECT phone_number, summary, interaction_id, start_time, end_time, duration FROM forward_info WHERE customer_id = ? AND phone_number = ?", customerID, cand)
-		if err := row.Scan(&phoneStored, &info.Summary, &info.InteractionID, &info.StartTime, &info.EndTime, &info.Duration); err != nil {
+		row := s.db.QueryRow("SELECT phone_number, summary, interaction_id, start_time, end_time, duration, extra_data FROM forward_info WHERE customer_id = ? AND phone_number = ?", customerID, cand)
+		if err := row.Scan(&phoneStored, &info.Summary, &info.InteractionID, &info.StartTime, &info.EndTime, &info.Duration, &extraRaw); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				continue
 			}
@@ -590,19 +647,74 @@ func (s *Server) handleGetForwardInfo(c *gin.Context) {
 			return
 		}
 		found = true
-		normalized = cand
 		break
 	}
 
 	if !found {
-		c.JSON(http.StatusOK, forwardInfoResponse{
-			Error: string(errorPhoneNumberNotFound),
-		})
+		resp := gin.H{
+			"summary":        "",
+			"interaction_id": "",
+			"start_time":     int64(0),
+			"end_time":       int64(0),
+			"duration":       int64(0),
+			"error":          string(errorPhoneNumberNotFound),
+		}
+		for k, v := range defaultExtraMap {
+			if _, exists := reservedKeys[k]; exists {
+				continue
+			}
+			resp[k] = v
+		}
+		c.JSON(http.StatusOK, resp)
 		return
 	}
 
-	info.Error = ""
-	c.JSON(http.StatusOK, info)
+	response := gin.H{
+		"summary":        info.Summary,
+		"interaction_id": info.InteractionID,
+		"start_time":     info.StartTime,
+		"end_time":       info.EndTime,
+		"duration":       info.Duration,
+		"error":          "",
+	}
+
+	if extraRaw.Valid && strings.TrimSpace(extraRaw.String) != "" {
+		var extra map[string]interface{}
+		if err := json.Unmarshal([]byte(extraRaw.String), &extra); err != nil {
+			log.Printf("failed to decode extra_data for %s: %v", phoneStored, err)
+			for k, v := range defaultExtraMap {
+				if _, exists := reservedKeys[k]; exists {
+					continue
+				}
+				response[k] = v
+			}
+		} else {
+			if len(extra) == 0 {
+				for k, v := range defaultExtraMap {
+					if _, exists := reservedKeys[k]; exists {
+						continue
+					}
+					response[k] = v
+				}
+			} else {
+				for k, v := range extra {
+					if _, exists := reservedKeys[k]; exists {
+						continue
+					}
+					response[k] = v
+				}
+			}
+		}
+	} else {
+		for k, v := range defaultExtraMap {
+			if _, exists := reservedKeys[k]; exists {
+				continue
+			}
+			response[k] = v
+		}
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 
 func normalizePhone(raw string, defaultCountryCode string, prependDefault bool) (string, error) {
@@ -707,4 +819,27 @@ func generateAPIKey() string {
 	}
 	// Rare fallback if crypto/rand fails.
 	return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
+}
+
+func encodeMapToJSON(m map[string]interface{}) (string, error) {
+	if m == nil {
+		return "{}", nil
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func decodeMapFromJSON(raw string) map[string]interface{} {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return map[string]interface{}{}
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil || m == nil {
+		return map[string]interface{}{}
+	}
+	return m
 }
