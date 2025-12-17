@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -25,7 +26,7 @@ import (
 
 // @title PPC Forward Service API
 // @version 1.0
-// @description Admin creates customers and forwards call info; customers fetch latest info per phone number.
+// @description Admin creates customers and forwards call info; customers pull the latest queued item (single pending entry per customer, phone number ignored on GET).
 // @BasePath /api/v1
 // @securityDefinitions.apikey AdminKey
 // @in header
@@ -38,6 +39,7 @@ import (
 type Server struct {
 	db       *sql.DB
 	adminKey string
+	queues   sync.Map // customerID -> *queueSlot
 }
 
 type apiError string
@@ -64,6 +66,70 @@ var (
 	}
 	phonePrefixes = buildPhonePrefixes(phoneCountryCodes)
 )
+
+const queueItemTTL = 10 * time.Second
+
+type queueSlot struct {
+	mu      sync.Mutex
+	pending *queuedForward
+}
+
+type queuedForward struct {
+	payload forwardPayload
+	extra   map[string]interface{}
+	done    chan struct{}
+	once    sync.Once
+	result  queueResult
+}
+
+type queueResult string
+
+const (
+	resultConsumed queueResult = "consumed"
+	resultExpired  queueResult = "expired"
+)
+
+type forwardPayload struct {
+	Summary       string
+	InteractionID string
+	StartTime     int64
+	EndTime       int64
+	Duration      int64
+	PhoneNumber   string
+}
+
+func (s *Server) queueForCustomer(id int64) *queueSlot {
+	val, _ := s.queues.LoadOrStore(id, &queueSlot{})
+	return val.(*queueSlot)
+}
+
+func (q *queuedForward) resolve(res queueResult) {
+	q.once.Do(func() {
+		q.result = res
+		close(q.done)
+	})
+}
+
+// expireQueuedAfterTTL clears a pending item if it was not consumed within the TTL.
+func (s *Server) expireQueuedAfterTTL(customerID int64, q *queuedForward) {
+	timer := time.NewTimer(queueItemTTL)
+	select {
+	case <-timer.C:
+	case <-q.done:
+		if !timer.Stop() {
+			<-timer.C
+		}
+		return
+	}
+
+	slot := s.queueForCustomer(customerID)
+	slot.mu.Lock()
+	if slot.pending == q {
+		slot.pending = nil
+		q.resolve(resultExpired)
+	}
+	slot.mu.Unlock()
+}
 
 func main() {
 	adminKey := os.Getenv("ADMIN_API_KEY")
@@ -501,15 +567,6 @@ type forwardInfoRequest struct {
 	ExtraData     map[string]interface{} `json:"extra_data"`
 }
 
-type forwardInfoResponse struct {
-	Summary       string `json:"summary"`
-	InteractionID string `json:"interaction_id"`
-	StartTime     int64  `json:"start_time"`
-	EndTime       int64  `json:"end_time"`
-	Duration      int64  `json:"duration"`
-	Error         string `json:"error"`
-}
-
 // handleUpsertForwardInfo inserts or updates the latest info for a phone number.
 // @Summary Upsert forward info
 // @Tags admin
@@ -551,56 +608,70 @@ func (s *Server) handleUpsertForwardInfo(c *gin.Context) {
 		return
 	}
 
-	var extraJSON interface{}
 	if req.ExtraData != nil {
-		serialized, err := json.Marshal(req.ExtraData)
-		if err != nil {
+		if _, err := json.Marshal(req.ExtraData); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid extra_data", "details": err.Error()})
 			return
 		}
-		extraJSON = string(serialized)
 	}
 
-	_, err = s.db.Exec(`
-		INSERT INTO forward_info (customer_id, phone_number, summary, interaction_id, start_time, end_time, duration, extra_data, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
-		ON CONFLICT(customer_id, phone_number) DO UPDATE SET
-			summary=excluded.summary,
-			interaction_id=excluded.interaction_id,
-			start_time=excluded.start_time,
-			end_time=excluded.end_time,
-			duration=excluded.duration,
-			extra_data=excluded.extra_data,
-			updated_at=strftime('%s','now');
-	`, customerID, normalized, req.Summary, req.InteractionID, req.StartTime, req.EndTime, req.Duration, extraJSON)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to store forward info"})
-		return
+	extraCopy := map[string]interface{}{}
+	for k, v := range req.ExtraData {
+		extraCopy[k] = v
 	}
 
-	c.JSON(http.StatusOK, gin.H{"phone_number": normalized, "customer_id": customerID, "customer_name": customerName, "status": "stored"})
+	slot := s.queueForCustomer(customerID)
+	for {
+		slot.mu.Lock()
+		if slot.pending == nil {
+			queued := &queuedForward{
+				payload: forwardPayload{
+					Summary:       req.Summary,
+					InteractionID: req.InteractionID,
+					StartTime:     req.StartTime,
+					EndTime:       req.EndTime,
+					Duration:      req.Duration,
+					PhoneNumber:   normalized,
+				},
+				extra: extraCopy,
+				done:  make(chan struct{}),
+			}
+
+			slot.pending = queued
+			slot.mu.Unlock()
+
+			// Expire the item if not consumed within TTL.
+			go s.expireQueuedAfterTTL(customerID, queued)
+
+			c.JSON(http.StatusOK, gin.H{
+				"status":              "queued",
+				"customer_id":         customerID,
+				"customer_name":       customerName,
+				"phone_number":        normalized,
+				"expires_in_seconds":  int(queueItemTTL.Seconds()),
+				"consumption_timeout": fmt.Sprintf("%.0fs", queueItemTTL.Seconds()),
+			})
+			return
+		}
+
+		current := slot.pending
+		slot.mu.Unlock()
+
+		// Wait until the current item is either consumed or expires; then try again to publish.
+		<-current.done
+	}
 }
 
-// handleGetForwardInfo returns the latest info for a phone number.
-// @Summary Get latest forward info by phone number
+// handleGetForwardInfo returns the latest unconsumed info, ignoring the requested phone number.
+// @Summary Get latest forward info (number is ignored; delivers newest)
 // @Tags customer
 // @Security CustomerKey
 // @Produce json
-// @Param phone_number query string true "Phone number"
+// @Param phone_number query string false "Deprecated: ignored; latest entry is always returned"
 // @Success 200 {object} map[string]interface{}
-// @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
 // @Router /forward-info [get]
 func (s *Server) handleGetForwardInfo(c *gin.Context) {
-	phone := c.Query("phone_number")
-	if phone == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "phone_number is required"})
-		return
-	}
-
-	defaultCC, _ := c.Get("customerDefaultCC")
-	ccStr, _ := defaultCC.(string)
-
 	defaultExtra, _ := c.Get("customerDefaultExtraData")
 	defaultExtraMap, _ := defaultExtra.(map[string]interface{})
 	if defaultExtraMap == nil {
@@ -616,41 +687,18 @@ func (s *Server) handleGetForwardInfo(c *gin.Context) {
 		"error":          {},
 	}
 
-	normalized, err := normalizePhone(phone, ccStr, true)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
 	customerID, ok := c.Get("customerID")
 	if !ok {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "customer context missing"})
 		return
 	}
+	custID, _ := customerID.(int64)
+	slot := s.queueForCustomer(custID)
 
-	candidates := []string{normalized}
-	if alt, err := normalizePhoneWithoutDefault(phone); err == nil && alt != normalized {
-		candidates = append(candidates, alt)
-	}
-
-	var info forwardInfoResponse
-	var extraRaw sql.NullString
-	var phoneStored string
-	found := false
-	for _, cand := range candidates {
-		row := s.db.QueryRow("SELECT phone_number, summary, interaction_id, start_time, end_time, duration, extra_data FROM forward_info WHERE customer_id = ? AND phone_number = ?", customerID, cand)
-		if err := row.Scan(&phoneStored, &info.Summary, &info.InteractionID, &info.StartTime, &info.EndTime, &info.Duration, &extraRaw); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "lookup failed"})
-			return
-		}
-		found = true
-		break
-	}
-
-	if !found {
+	slot.mu.Lock()
+	pending := slot.pending
+	if pending == nil {
+		slot.mu.Unlock()
 		resp := gin.H{
 			"summary":        "",
 			"interaction_id": "",
@@ -669,41 +717,25 @@ func (s *Server) handleGetForwardInfo(c *gin.Context) {
 		return
 	}
 
+	slot.pending = nil
+	slot.mu.Unlock()
+	pending.resolve(resultConsumed)
+
 	response := gin.H{
-		"summary":        info.Summary,
-		"interaction_id": info.InteractionID,
-		"start_time":     info.StartTime,
-		"end_time":       info.EndTime,
-		"duration":       info.Duration,
+		"summary":        pending.payload.Summary,
+		"interaction_id": pending.payload.InteractionID,
+		"start_time":     pending.payload.StartTime,
+		"end_time":       pending.payload.EndTime,
+		"duration":       pending.payload.Duration,
 		"error":          "",
 	}
 
-	if extraRaw.Valid && strings.TrimSpace(extraRaw.String) != "" {
-		var extra map[string]interface{}
-		if err := json.Unmarshal([]byte(extraRaw.String), &extra); err != nil {
-			log.Printf("failed to decode extra_data for %s: %v", phoneStored, err)
-			for k, v := range defaultExtraMap {
-				if _, exists := reservedKeys[k]; exists {
-					continue
-				}
-				response[k] = v
+	if len(pending.extra) > 0 {
+		for k, v := range pending.extra {
+			if _, exists := reservedKeys[k]; exists {
+				continue
 			}
-		} else {
-			if len(extra) == 0 {
-				for k, v := range defaultExtraMap {
-					if _, exists := reservedKeys[k]; exists {
-						continue
-					}
-					response[k] = v
-				}
-			} else {
-				for k, v := range extra {
-					if _, exists := reservedKeys[k]; exists {
-						continue
-					}
-					response[k] = v
-				}
-			}
+			response[k] = v
 		}
 	} else {
 		for k, v := range defaultExtraMap {
@@ -805,11 +837,6 @@ func validateCountryCode(code string) error {
 		return fmt.Errorf("default_country_code must be 1 to 4 digits")
 	}
 	return nil
-}
-
-// normalizePhoneWithoutDefault leaves the number as-is (no automatic country prepend) but still strips known prefixes.
-func normalizePhoneWithoutDefault(raw string) (string, error) {
-	return normalizePhone(raw, "", false)
 }
 
 func generateAPIKey() string {

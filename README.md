@@ -9,6 +9,13 @@ Dedicated service for PPC (must win in Romania) that enables getting information
 - Genesys webhook triggerred, fetched the information published by the low code
 - Call summary and other relevant fields from the conversation is shown in genesys 🎉
 
+## Single-slot queue semantics
+- The service now behaves like a queue with capacity **1 per customer**.
+- An admin `POST /forward-info` waits until the customer slot is free (no timeout), then queues its payload and returns immediately with `"status":"queued"`.
+- Once queued, the item must be consumed within **10 seconds**; otherwise it expires and is dropped.
+- Only one unconsumed entry can exist at a time for a customer. If another admin call arrives while one is pending, it waits (potentially forever) until that pending item is consumed or expires, then proceeds.
+- The customer `GET /forward-info` always returns the **latest unconsumed** item, consumes it (removing it from the queue), and ignores the `phone_number` query param.
+- Concurrency edge case: if two admin calls land simultaneously on an empty queue, one enqueues and the other waits; if the first item is consumed within 10s the waiter proceeds immediately, otherwise it proceeds after the first item expires at 10s.
 
 ## Deployment
 - Deployed on aws ec2 machine called ppc-forward
@@ -107,13 +114,16 @@ curl -X POST http://localhost:8080/api/v1/forward-info \
 If the phone number does not include an international prefix, the customer's `default_country_code` is automatically prepended (e.g., `0722...` becomes `+40 722...` for Romania) before normalization. Forward info is stored per customer; different customers can store different data for the same phone number, distinguished by `customer_name` in the admin upsert request.
 
 `extra_data` is optional and must be a JSON object. Its key/value pairs are stored as-is and later merged into the customer-facing GET response at the top level (flat structure). Keys that collide with built-in fields (`summary`, `interaction_id`, `start_time`, `end_time`, `duration`, `error`) are ignored.
-If no `extra_data` exists for a record, the customer's `default_extra_data` (if set) is merged instead. The same default extras also appear in error responses.
+Queue behavior for this endpoint:
+- If no entry is pending, the payload is queued and the HTTP response returns immediately with `{"status":"queued","expires_in_seconds":10,...}`.
+- If the queued item is consumed within 10s, customers get it and the slot clears; if not, it auto-expires after 10s and the slot frees.
+- If another item is still pending when you POST, your request waits until that item is consumed or expires, then queues your payload; there is no POST timeout for waiting on the slot.
 
 ## Customer endpoint (header: `X-API-Key: <customer_api_key>`, base path `/api/v1`)
 
 ### Get latest forward info
 ```bash
-curl "http://localhost:8080/api/v1/forward-info?phone_number=+40722123456" \
+curl "http://localhost:8080/api/v1/forward-info" \
   -H "X-API-Key: <customer_api_key>"
 ```
 
@@ -131,7 +141,10 @@ Example response:
   "error": ""
 }
 ```
-If no record is found, the response keeps the same shape with base fields empty/zero, includes `"error": "phone_number_not_found"`, and merges `default_extra_data` (if any) at the top level.
+Notes:
+- The `phone_number` query parameter is ignored; the endpoint always returns the latest unconsumed item for that customer.
+- Each successful GET consumes the queued item, clearing the slot for the next admin POST.
+- If the queue is empty, the response keeps the same shape with base fields empty/zero, includes `"error": "phone_number_not_found"`, and merges `default_extra_data` (if any) at the top level.
 
 ## Swagger
 - UI: `http://localhost:8080/swagger/index.html`
@@ -142,4 +155,4 @@ $(go env GOPATH)/bin/swag init --parseDependency --parseInternal --output docs
 
 ## Database
 - File: `data/forward.db` (auto-created).
-- Tables: `customers`, `forward_info` (one row per normalized phone number, upsert on conflict).
+- Tables: `customers`, `forward_info` (legacy; current queue behavior keeps only in-memory pending items per customer).
